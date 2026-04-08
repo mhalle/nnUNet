@@ -78,6 +78,45 @@ class ModelBundle:
         return self.plans_manager.get_label_manager(self.dataset_json)
 
     @classmethod
+    def from_task(
+        cls,
+        dataset_name_or_id: Union[str, int],
+        *,
+        trainer_name: str = "nnUNetTrainer",
+        plans_identifier: str = "nnUNetPlans",
+        configuration: str = "3d_fullres",
+        use_folds: Union[Tuple[Union[int, str], ...], List, str, None] = None,
+        checkpoint_name: str = "checkpoint_final.pth",
+    ) -> "ModelBundle":
+        """Construct a bundle by looking up a model in ``nnUNet_results``.
+
+        This is a convenience over :meth:`from_folder` for the common case
+        where the trained-model folder lives at the standard nnU-Net layout
+        ``$nnUNet_results/Dataset###_Name/<trainer>__<plans>__<config>/``.
+
+        Parameters
+        ----------
+        dataset_name_or_id
+            Either the integer dataset id (e.g. 4) or the full dataset name
+            (e.g. ``"Dataset004_Hippocampus"``). nnU-Net resolves either form.
+        trainer_name, plans_identifier, configuration
+            Selectors that pick which trained model under the dataset folder
+            to load. Defaults match nnU-Net's standard 3D full-resolution
+            training run.
+        use_folds, checkpoint_name
+            Forwarded to :meth:`from_folder`.
+        """
+        from nnunetv2.utilities.file_path_utilities import get_output_folder
+
+        model_training_output_dir = get_output_folder(
+            dataset_name_or_id,
+            trainer_name=trainer_name,
+            plans_identifier=plans_identifier,
+            configuration=configuration,
+        )
+        return cls.from_folder(model_training_output_dir, use_folds, checkpoint_name)
+
+    @classmethod
     def from_folder(
         cls,
         model_training_output_dir: str,
