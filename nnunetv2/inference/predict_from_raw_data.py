@@ -68,67 +68,26 @@ class nnUNetPredictor(object):
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              checkpoint_name: str = 'checkpoint_final.pth'):
         """
-        This is used when making predictions with a trained model
+        This is used when making predictions with a trained model.
+
+        Folder discovery, plans parsing, and network construction now live in
+        ``nnunetv2.inference.backends.torch.ModelBundle.from_folder``. This
+        method is a thin shim that builds the bundle and forwards its fields
+        through ``manual_initialization``, which also handles compile and
+        DDP-aware setup. The two init paths now share a single compile code
+        path instead of duplicating it.
         """
-        if use_folds is None:
-            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
-
-        dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
-        plans = load_json(join(model_training_output_dir, 'plans.json'))
-        plans_manager = PlansManager(plans)
-
-        if isinstance(use_folds, str):
-            use_folds = [use_folds]
-
-        parameters = []
-        for i, f in enumerate(use_folds):
-            f = int(f) if f != 'all' else f
-            from nnunetv2.utilities.checkpoint_io import load_checkpoint
-            checkpoint = load_checkpoint(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                         map_location=torch.device('cpu'),
-                                         load_optimizer=False)
-            if i == 0:
-                trainer_name = checkpoint['trainer_name']
-                configuration_name = checkpoint['init_args']['configuration']
-                inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
-                    'inference_allowed_mirroring_axes' in checkpoint.keys() else None
-
-            parameters.append(checkpoint['network_weights'])
-
-        configuration_manager = plans_manager.get_configuration(configuration_name)
-        # restore network
-        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                                    trainer_name, 'nnunetv2.training.nnUNetTrainer')
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
-                               f'Please place it there (in any .py file)!')
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+        from nnunetv2.inference.backends.torch import ModelBundle
+        bundle = ModelBundle.from_folder(model_training_output_dir, use_folds, checkpoint_name)
+        self.manual_initialization(
+            network=bundle.network,
+            plans_manager=bundle.plans_manager,
+            configuration_manager=bundle.configuration_manager,
+            parameters=bundle.list_of_parameters,
+            dataset_json=bundle.dataset_json,
+            trainer_name=bundle.trainer_name,
+            inference_allowed_mirroring_axes=bundle.allowed_mirroring_axes,
         )
-
-        self.plans_manager = plans_manager
-        self.configuration_manager = configuration_manager
-        self.list_of_parameters = parameters
-
-        # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
-        network.load_state_dict(parameters[0])
-
-        self.network = network
-
-        self.dataset_json = dataset_json
-        self.trainer_name = trainer_name
-        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
-        self.label_manager = plans_manager.get_label_manager(dataset_json)
-        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
-            self.network = torch.compile(self.network)
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
