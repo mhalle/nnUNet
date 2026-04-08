@@ -17,5 +17,6 @@ as _torch`` if it needs both.
 """
 
 from nnunetv2.inference.backends.torch.bundle import ModelBundle
+from nnunetv2.inference.backends.torch.engine import InferenceEngine
 
-__all__ = ["ModelBundle"]
+__all__ = ["InferenceEngine", "ModelBundle"]
