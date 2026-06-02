@@ -469,6 +469,9 @@ def _resample_seg(
             idx = torch.as_tensor(_scipy_nn_index(int(n_in), int(n_out), str(mode), convention == "center"), device=out.device)
             out = out.index_select(sp_axis + 1, idx)
         return out
+    dev = data.device
+    _empty = (torch.mps.empty_cache if dev.type == "mps"
+              else torch.cuda.empty_cache if dev.type == "cuda" else None)
     unique = torch.unique(data)
     result_dtype = torch.int16 if int(unique.max()) > 127 else torch.int8
     if convention == "center" and not anti_alias:
@@ -496,7 +499,86 @@ def _resample_seg(
             take = chunk_best > best_val
             best_val = torch.where(take, chunk_best, best_val)
             best_lab = torch.where(take, chunk_lab, best_lab)
+        # Release the per-region intermediates so a 100+-label map streams at
+        # ~one-region peak instead of letting the caching allocator accumulate
+        # across iterations (otherwise MPS OOMs on a full-res output).
+        del onehot, soft, chunk_best, chunk_idx, chunk_lab
+        if _empty is not None:
+            _empty()
     return best_lab.to(result_dtype)[None]   # (1, X', Y', Z')
+
+
+def resample_logits_argmax(
+    logits: Union[torch.Tensor, np.ndarray],   # (C, X, Y, Z) at model spacing
+    new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+    device: Union[torch.device, str, None] = None,
+    aa_threshold: float = 1.1,
+    mem_budget_bytes: int = 800_000_000,
+    out_dtype=np.uint8,
+) -> np.ndarray:
+    """Memory-bounded linear logit-space inverse resample + argmax (path B).
+
+    Resamples K-channel logits from model spacing to ``new_shape`` and argmaxes,
+    but **streams over output slabs along axis 0** so the K-channel
+    full-resolution volume is never materialized - the torch analogue of the MLX
+    fused/slab inverse. Peak GPU memory is ~``mem_budget_bytes`` (one slab's
+    ``C x slab x Yo x Zo`` buffer) instead of ``C x full-native`` (which OOMs for
+    100+ classes at full res). Logits stay host-side; only the small x-band each
+    slab needs is moved to the GPU, and the device cache is released per slab.
+
+    Half-pixel sampling (``align_corners=False``), so it matches nnU-Net's
+    forward resample / skimage / ``F.interpolate``. Returns an ``(X, Y, Z)``
+    integer label array. This is what lets nnU-Net's native (path-B) inverse run
+    on a big multi-class volume without TS's homegrown label-upsample.
+    """
+    if device is None:
+        device = _best_device()
+    device = torch.device(device)
+
+    if isinstance(logits, torch.Tensor):
+        src = logits.detach().to("cpu")          # host-side; stream bands to GPU
+    else:
+        src = torch.as_tensor(np.ascontiguousarray(logits))
+    assert src.ndim == 4, "logits must be (C, X, Y, Z)"
+    C, Xm, Ym, Zm = src.shape
+    Xo, Yo, Zo = (int(s) for s in new_shape)
+
+    def _w(n_in, n_out):
+        r = _axis_weights(n_in, n_out, aa_threshold, device)
+        return None if r is None else r[0]       # (n_out, n_in) linear on upsample
+    Wx, wy, wz = _w(Xm, Xo), _w(Ym, Yo), _w(Zm, Zo)
+
+    out = torch.empty((Xo, Yo, Zo), dtype=torch.int16, device=device)
+    per_plane = max(1, C * Yo * Zo * 4)
+    slab = max(1, min(Xo, mem_budget_bytes // per_plane))
+    _empty = (torch.mps.empty_cache if device.type == "mps"
+              else torch.cuda.empty_cache if device.type == "cuda" else None)
+
+    # The tiny x-band contraction ((M,2)@(2,1)-ish) hits an MPS matmul bug -
+    # verified wrong by ~2 abs vs CPU/einsum - so the x-band goes through einsum.
+    # The y/z resamples are large (e.g. 167->768) where matmul is both correct
+    # and ~2x faster than einsum on MPS, so those use the matmul _resample_axis.
+    with torch.no_grad():
+        for xa in range(0, Xo, slab):
+            xb = min(xa + slab, Xo)
+            if Wx is None:                        # x identity (Xm == Xo)
+                sub = src[:, xa:xb].to(device).float()
+            else:
+                wxr = Wx[xa:xb]                   # (slab_n, Xm)
+                idx = torch.nonzero(wxr.abs().sum(0) > 0).squeeze(1)
+                lo, hi = int(idx.min()), int(idx.max()) + 1
+                band = src[:, lo:hi].to(device).float()              # (C, band, Ym, Zm)
+                sub = torch.einsum('os,csyz->coyz', wxr[:, lo:hi], band)  # einsum (tiny band)
+                del band
+            if wy is not None:
+                sub = _resample_axis(sub, 2, wy)  # matmul (C, slab, Yo, Zm)
+            if wz is not None:
+                sub = _resample_axis(sub, 3, wz)  # matmul (C, slab, Yo, Zo)
+            out[xa:xb] = sub.argmax(0).to(torch.int16)
+            del sub
+            if _empty is not None:
+                _empty()
+    return out.cpu().numpy().astype(out_dtype, copy=False)
 
 
 if __name__ == "__main__":
