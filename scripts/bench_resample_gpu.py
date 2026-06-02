@@ -58,7 +58,7 @@ def report(name, dt, out, ref=None):
         r = ref[0]
         if isinstance(r, torch.Tensor):
             r = r.detach().cpu().numpy()
-        line += f"   vs-ref max|Δ|={np.abs(o - r).max():.3g}  rmse={np.sqrt(((o-r)**2).mean()):.3g}"
+        line += f"   vs-ref max|delta|={np.abs(o - r).max():.3g}  rmse={np.sqrt(((o-r)**2).mean()):.3g}"
     print(line)
     return o
 
@@ -86,7 +86,7 @@ def bench_real(path, target_mm):
                             is_seg=False, device=DEV)
     report(f"AA cubic/linear ({DEV.type.upper()})", dt_a, out_a, ref=(ref,))
 
-    print(f"  * torch trilinear3d unsupported on MPS — CPU is its only device for 3D")
+    print(f"  * torch trilinear3d unsupported on MPS - CPU is its only device for 3D")
     print(f"  speedup vs scipy:  torch-cpu {dt_s/dt_t:5.1f}x   AA-{DEV.type} {dt_s/dt_a:5.1f}x")
 
 
@@ -124,7 +124,7 @@ def upsample_agreement():
                          is_seg=False, device=DEV, reps=1)
     ot = out_t[0].cpu().numpy() if isinstance(out_t, torch.Tensor) else out_t[0]
     oa = out_a[0].cpu().numpy() if isinstance(out_a, torch.Tensor) else out_a[0]
-    print(f"  max|Δ| vs torch trilinear = {np.abs(ot-oa).max():.4g}   rmse = {np.sqrt(((ot-oa)**2).mean()):.4g}")
+    print(f"  max|delta| vs torch trilinear = {np.abs(ot-oa).max():.4g}   rmse = {np.sqrt(((ot-oa)**2).mean()):.4g}")
 
 
 if __name__ == "__main__":
