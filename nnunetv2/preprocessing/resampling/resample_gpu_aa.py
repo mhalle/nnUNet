@@ -106,7 +106,7 @@ def _axis_weights(
 
 
 @functools.lru_cache(maxsize=128)
-def _scipy_axis_matrix(n_in: int, n_out: int, order: int, mode: str) -> np.ndarray:
+def _scipy_axis_matrix(n_in: int, n_out: int, order: int, mode: str, grid_mode: bool = False) -> np.ndarray:
     """Exact 1-D operator of ``scipy.ndimage.zoom`` along one axis as an ``(n_out, n_in)``
     float64 matrix.
 
@@ -119,30 +119,37 @@ def _scipy_axis_matrix(n_in: int, n_out: int, order: int, mode: str) -> np.ndarr
     from scipy import ndimage
     if n_in == n_out:
         return np.eye(n_in)
-    probe = ndimage.zoom(np.eye(n_in, dtype=np.float64), (1.0, n_out / n_in), order=order, mode=mode)
+    probe = ndimage.zoom(np.eye(n_in, dtype=np.float64), (1.0, n_out / n_in), order=order, mode=mode, grid_mode=grid_mode)
     if probe.shape != (n_in, n_out):
         raise RuntimeError(f"scipy zoom probe produced {probe.shape}, expected {(n_in, n_out)}")
     return np.ascontiguousarray(probe.T)
 
 
 @functools.lru_cache(maxsize=128)
-def _scipy_nn_index(n_in: int, n_out: int, mode: str) -> np.ndarray:
+def _scipy_nn_index(n_in: int, n_out: int, mode: str, grid_mode: bool = False) -> np.ndarray:
     """Input index chosen by ``scipy.ndimage.zoom(order=0)`` for each output index (exact)."""
-    w = _scipy_axis_matrix(n_in, n_out, 0, mode)          # (n_out, n_in), one 1 per row
+    w = _scipy_axis_matrix(n_in, n_out, 0, mode, grid_mode)          # (n_out, n_in), one 1 per row
     return np.ascontiguousarray(w.argmax(axis=1))
 
 
-def _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, dtype):
-    """``(w, cubic)`` for one axis, or ``None`` for identity. ``convention="center"`` is the
-    half-pixel / anti-aliased policy of :func:`_axis_weights`; ``"corner"`` is the exact
-    ``ndimage.zoom`` operator (corner-aligned, no anti-aliasing, honors ``order``/``mode``)."""
+def _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, dtype, anti_alias=False):
+    """``(w, cubic)`` for one axis, or ``None`` for identity.
+
+    * ``"corner"``: exact ``scipy.ndimage.zoom`` operator (voxel-corner point grid).
+    * ``"center"``, ``anti_alias=False``: exact ``zoom(grid_mode=True)`` operator (voxel-center),
+      i.e. what skimage ``resize`` and nnU-Net's ``resample_data_or_seg_to_shape`` compute.
+    * ``"center"``, ``anti_alias=True``: the anti-aliased policy of :func:`_axis_weights`.
+    """
     if n_in == n_out:
         return None
     if convention == "corner":
-        w = torch.as_tensor(_scipy_axis_matrix(int(n_in), int(n_out), int(order), str(mode)), device=device, dtype=dtype)
+        w = torch.as_tensor(_scipy_axis_matrix(int(n_in), int(n_out), int(order), str(mode), False), device=device, dtype=dtype)
         return w, order >= 2
     if convention != "center":
         raise ValueError(f"unknown convention {convention!r}; expected 'center' or 'corner'")
+    if not anti_alias:
+        w = torch.as_tensor(_scipy_axis_matrix(int(n_in), int(n_out), int(order), str(mode), True), device=device, dtype=dtype)
+        return w, order >= 2
     return _axis_weights(n_in, n_out, aa_threshold, device, dtype)
 
 
@@ -164,6 +171,7 @@ def _separable_resample(
     convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
+    anti_alias: bool = False,
 ) -> torch.Tensor:
     device = data.device
     out = data
@@ -171,19 +179,20 @@ def _separable_resample(
     for sp_axis in range(3):                # spatial axes -> tensor dims 1,2,3
         n_in = out.shape[sp_axis + 1]
         n_out = int(new_shape[sp_axis])
-        res = _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, out.dtype)
+        res = _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, out.dtype, anti_alias)
         if res is None:
             continue
         w, cubic = res
         if cubic:
             did_cubic = True
         out = _resample_axis(out, sp_axis + 1, w)
-    # scipy never clamps; clipping is part of the anti-aliased ("center") policy only.
+    # scipy.ndimage.zoom never clips ("corner"). skimage.resize clips the output to the input's
+    # value range per call (clip=True), which nnU-Net inherits per channel; the anti-aliased
+    # policy clips cubic ringing for the same reason. Per channel, so channel chunking is exact.
     if clamp_range and did_cubic and convention == "center":
-        # Clip cubic ringing to the input's value range (interior sharpness kept).
-        lo = data.amin()
-        hi = data.amax()
-        out = torch.clamp(out, lo, hi)
+        lo = data.amin(dim=(1, 2, 3), keepdim=True)
+        hi = data.amax(dim=(1, 2, 3), keepdim=True)
+        out = torch.maximum(torch.minimum(out, hi), lo)
     return out
 
 
@@ -200,9 +209,22 @@ def resample_aa_torch(
     convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
+    anti_alias: bool = False,
     **kwargs,
 ) -> Union[torch.Tensor, np.ndarray]:
     """GPU separable resample. ``data`` must be ``(c, x, y, z)``.
+
+    **By default this is nnU-Net's own resampler, on the GPU.** With
+    ``convention="center"`` and ``anti_alias=False`` (the defaults) the result equals
+    ``resample_data_or_seg_to_shape`` / skimage ``resize(order, mode="edge",
+    anti_aliasing=False)`` to float precision on CPU (float64) and to ~1e-4 relative on
+    MPS/CUDA (float32): voxel-center sampling, spline prefilter, skimage's per-channel clip to
+    the input range, and for ``is_seg=True`` nnU-Net's own label rule (each label's resized
+    indicator thresholded at 0.5 and painted in ascending label order; ``order=0`` is an exact
+    nearest-neighbor gather). Not replicated: nnU-Net's *separate-z* policy for strongly
+    anisotropic spacing (anisotropy > 3, or ``force_separate_z``), which resamples the
+    low-resolution axis with ``order_z`` by a different code path; ``order_z`` and
+    ``force_separate_z`` are accepted and ignored.
 
     Two sampling conventions, selected with ``convention`` and named by where the value
     sits in its voxel:
@@ -210,9 +232,10 @@ def resample_aa_torch(
     * ``"center"`` (default) - voxel-center: the value sits at the center of a cell that
       tiles the field of view, so output sample ``j`` reads input coordinate
       ``(j + 0.5) * n_in/n_out - 0.5`` (half-pixel, ``align_corners=False``; skimage
-      ``resize``, ``F.interpolate``, ITK, nnU-Net's own resampler). Anti-aliased
-      Catmull-Rom when downsampling by more than ``aa_threshold``, linear otherwise;
-      ``order`` / ``mode`` are ignored.
+      ``resize``, ``F.interpolate``, ITK, nnU-Net's own resampler). Exact skimage/nnU-Net
+      operator for ``order`` / ``mode`` when ``anti_alias=False``; with ``anti_alias=True``
+      an anti-aliased policy instead - Catmull-Rom scaled by the factor when downsampling by
+      more than ``aa_threshold``, linear otherwise (``order`` / ``mode`` ignored).
     * ``"corner"`` - voxel-corner point grid, exactly as ``scipy.ndimage.zoom(order=order,
       mode=mode, grid_mode=False)``: values are points at ``i * spacing`` and the rescale
       preserves the span of those points, ``j * (n_in-1)/(n_out-1)`` (``align_corners=True``;
@@ -225,9 +248,10 @@ def resample_aa_torch(
       that is a third convention, not offered here.
 
     Anti-aliasing at inference is a distribution shift for models trained with the
-    scipy/skimage resamplers (it lowers recall on sub-centimeter structures), so use
-    ``"center"`` with AA only for models trained with it; for existing TotalSegmentator
-    models use ``convention="corner"``.
+    scipy/skimage resamplers (it lowers recall on sub-centimeter structures), so it is
+    opt-in (``anti_alias=True``) and meant for models trained with it. For existing
+    nnU-Net models use the defaults; for TotalSegmentator's own pre-resampling use
+    ``convention="corner"``.
 
     Signature-compatible with nnU-Net's ``resampling_fn_data`` /
     ``resampling_fn_seg`` / ``resampling_fn_probabilities`` (extra plans kwargs
@@ -257,7 +281,8 @@ def resample_aa_torch(
 
     # float64 math on CPU for scipy parity when the input is float64; float32 elsewhere.
     is_f64 = (data.dtype == np.float64) if input_was_numpy else (data.dtype == torch.float64)
-    work = torch.float64 if (convention == "corner" and device.type == "cpu" and is_f64) else torch.float32
+    exact = convention == "corner" or not anti_alias
+    work = torch.float64 if (exact and device.type == "cpu" and is_f64) else torch.float32
     with torch.no_grad():
         if input_was_numpy:
             t = torch.as_tensor(np.ascontiguousarray(data)).to(device)
@@ -266,7 +291,7 @@ def resample_aa_torch(
 
         if is_seg:
             result = _resample_seg(t, new_shape, aa_threshold, seg_resample_chunk_labels,
-                                   convention=convention, order=order, mode=mode)
+                                   convention=convention, order=order, mode=mode, anti_alias=anti_alias)
         elif t.shape[0] > channel_chunk:
             # Multi-channel (e.g. K-class probabilities/logits at export): the
             # per-axis matmul materializes a full (C, *new_shape) intermediate
@@ -278,21 +303,28 @@ def resample_aa_torch(
             for s in range(0, C, channel_chunk):
                 e = min(s + channel_chunk, C)
                 result[s:e] = _separable_resample(t[s:e].to(work), new_shape, aa_threshold,
-                                                  convention=convention, order=order, mode=mode)
+                                                  convention=convention, order=order, mode=mode, anti_alias=anti_alias)
         else:
             result = _separable_resample(t.to(work), new_shape, aa_threshold,
-                                         convention=convention, order=order, mode=mode)
+                                         convention=convention, order=order, mode=mode, anti_alias=anti_alias)
 
         if input_was_numpy:
             r = result.cpu().numpy()
-            if convention == "corner" and np.issubdtype(data.dtype, np.integer) and not is_seg:
-                r = np.where(r > 0, r + 0.5, r - 0.5)      # scipy's integer-output rounding
+            if exact and np.issubdtype(data.dtype, np.integer) and not is_seg:
+                r = np.where(r > 0, r + 0.5, r - 0.5)      # scipy's / skimage's integer-output rounding
             result = r.astype(data.dtype, copy=False)
         else:
             result = result.to(orig_device)
             if (not is_seg) and data.dtype.is_floating_point and result.dtype != data.dtype:
                 result = result.to(data.dtype)
     return result
+
+
+def skimage_resize_torch(data, new_shape, order: int = 3, device=None, is_seg: bool = False):
+    """skimage ``resize(order, mode="edge", anti_aliasing=False)`` / nnU-Net
+    ``resample_data_or_seg_to_shape`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``."""
+    return resample_aa_torch(data, new_shape, is_seg=is_seg, device=device,
+                             convention="center", order=order, mode="nearest", anti_alias=False)
 
 
 def scipy_zoom_torch(data, new_shape, order: int = 3, mode: str = "nearest", device=None, is_seg: bool = False):
@@ -310,33 +342,47 @@ def _resample_seg(
     convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
+    anti_alias: bool = False,
 ) -> torch.Tensor:
-    """Label-preserving resample: one-hot -> separable resample -> argmax.
+    """Label-preserving resample.
 
-    Anti-aliased per-axis blending of the per-label indicator volumes, then the
-    label whose (soft) indicator is largest wins. Processes unique labels in
-    chunks to bound memory; assumes a single channel (C == 1), as nnU-Net seg.
+    * exact conventions with ``order=0``: the nearest-neighbor gather of ``zoom(order=0)``;
+    * ``"center"`` without anti-aliasing: nnU-Net's rule (``resample_data_or_seg``) - resize
+      each label's indicator, threshold at 0.5, paint in ascending label order (later labels
+      overwrite; unpainted voxels are 0);
+    * otherwise: one-hot -> separable resample -> argmax, in label chunks to bound memory.
+    Assumes a single channel (C == 1), as nnU-Net seg.
     """
     assert data.shape[0] == 1, "seg resampling expects a single channel"
-    if convention == "corner" and order == 0:
-        # exact nearest-neighbor gather of scipy.ndimage.zoom(order=0)
+    exact = convention == "corner" or not anti_alias
+    if exact and order == 0:
         out = data
         for sp_axis in range(3):
             n_in, n_out = out.shape[sp_axis + 1], int(new_shape[sp_axis])
             if n_in == n_out:
                 continue
-            idx = torch.as_tensor(_scipy_nn_index(int(n_in), int(n_out), str(mode)), device=out.device)
+            idx = torch.as_tensor(_scipy_nn_index(int(n_in), int(n_out), str(mode), convention == "center"), device=out.device)
             out = out.index_select(sp_axis + 1, idx)
         return out
     unique = torch.unique(data)
     result_dtype = torch.int16 if int(unique.max()) > 127 else torch.int8
+    if convention == "center" and not anti_alias:
+        out = torch.zeros((1, *new_shape), dtype=result_dtype, device=data.device)
+        for start in range(0, len(unique), chunk_labels):
+            labs = unique[start:start + chunk_labels]
+            onehot = (data[0][None] == labs.view(-1, 1, 1, 1)).float()
+            soft = _separable_resample(onehot, new_shape, aa_threshold, clamp_range=False,
+                                       convention=convention, order=order, mode=mode, anti_alias=False)
+            for i in range(len(labs)):
+                out[0][soft[i] > 0.5] = labs[i].to(result_dtype)
+        return out
     best_val = None
     best_lab = None
     for start in range(0, len(unique), chunk_labels):
         labs = unique[start:start + chunk_labels]
         onehot = (data[0][None] == labs.view(-1, 1, 1, 1)).float()  # (L, X, Y, Z)
         soft = _separable_resample(onehot, new_shape, aa_threshold, clamp_range=False,
-                                   convention=convention, order=order, mode=mode)
+                                   convention=convention, order=order, mode=mode, anti_alias=anti_alias)
         chunk_best, chunk_idx = soft.max(dim=0)                     # (X', Y', Z')
         chunk_lab = labs[chunk_idx]
         if best_val is None:

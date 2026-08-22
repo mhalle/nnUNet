@@ -100,6 +100,20 @@ Quality / correctness (`scripts/test_resample_gpu_aa.py`, 12 checks):
 > value of `resample_aa_torch` is anti-aliased downsampling that runs on the GPU,
 > at 24-40x the nnU-Net scipy default that ships in stock plans.
 
+## Defaults: nnU-Net's own resampler, on the GPU
+
+With the defaults (`convention="center"`, `anti_alias=False`) `resample_aa_torch` is
+`resample_data_or_seg_to_shape` on MPS / CUDA / CPU: skimage `resize(order, mode="edge",
+anti_aliasing=False)` semantics for data - voxel-center sampling, spline prefilter and
+skimage's per-channel clip to the input range - and nnU-Net's own label rule for
+`is_seg=True` (each label's resized indicator thresholded at 0.5 and painted in ascending
+label order; `order=0` is an exact nearest-neighbor gather). Verified to 1e-12 on CPU
+(float64) and ~1e-3 on HU-scale data on MPS (float32); labels bit-identical on both.
+Anti-aliasing is opt-in (`anti_alias=True`), for models trained with it. Not replicated:
+nnU-Net's *separate-z* policy for strongly anisotropic spacing (anisotropy > 3 or
+`force_separate_z`), which resamples the low-resolution axis with `order_z` by a different
+code path - `order_z` / `force_separate_z` are accepted and ignored.
+
 ## Sampling conventions: `convention="center"` vs `convention="corner"`
 
 Two resamplers can agree on "linear" or "cubic" and still disagree about *where* the
@@ -108,7 +122,7 @@ sits in its voxel:
 
 | `convention` | model | output sample `j` reads input coordinate | anti-aliasing | matches |
 |---|---|---|---|---|
-| `"center"` (default) | **voxel-center**: value at the center of a cell; cells tile the field of view | `(j + 0.5) * n_in/n_out - 0.5` (half-pixel, `align_corners=False`) | Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, ITK, nnU-Net's own `resample_data_or_seg_to_shape` |
+| `"center"` (default) | **voxel-center**: value at the center of a cell; cells tile the field of view | `(j + 0.5) * n_in/n_out - 0.5` (half-pixel, `align_corners=False`) | none by default (exact skimage/nnU-Net); `anti_alias=True`: Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, ITK, nnU-Net's own `resample_data_or_seg_to_shape` |
 | `"corner"` | **voxel-corner point grid**: values are points at `i * spacing`; the rescale preserves the *span of the points* | `j * (n_in - 1) / (n_out - 1)` (`align_corners=True`, `grid_mode=False`) | none; `order` / `mode` honored | `scipy.ndimage.zoom`, i.e. TotalSegmentator's `change_spacing` |
 
 A corner-sampled grid that preserved the *cell* extent instead (`j * n_in/n_out`, the
@@ -135,9 +149,10 @@ for models trained with it.** `convention="corner", order=3, mode="nearest"` rep
 `change_spacing(order=3)` and reaches Dice 0.9966 against stock, at the re-run floor (0.9987).
 
 ```python
-from nnunetv2.preprocessing.resampling.resample_gpu_aa import resample_aa_torch, scipy_zoom_torch
+from nnunetv2.preprocessing.resampling.resample_gpu_aa import resample_aa_torch, scipy_zoom_torch, skimage_resize_torch
 
-img3mm  = scipy_zoom_torch(data[None], new_shape, order=3, mode="nearest", device="mps")[0]   # == ndimage.zoom
+nnunet  = resample_aa_torch(data[None], new_shape, device="mps")[0]                           # == nnU-Net's resampler (skimage, voxel-center)
+img3mm  = scipy_zoom_torch(data[None], new_shape, order=3, mode="nearest", device="mps")[0]   # == ndimage.zoom (voxel-corner, TotalSegmentator)
 labels  = scipy_zoom_torch(seg[None], native_shape, order=0, is_seg=True, device="mps")[0]   # == zoom(order=0)
-aa_img  = resample_aa_torch(data[None], new_shape, device="mps")[0]                           # grid + AA (opt-in)
+aa_img  = resample_aa_torch(data[None], new_shape, device="mps", anti_alias=True)[0]          # anti-aliased policy (opt-in)
 ```
