@@ -133,16 +133,16 @@ def _scipy_nn_index(n_in: int, n_out: int, mode: str) -> np.ndarray:
 
 
 def _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, dtype):
-    """``(w, cubic)`` for one axis, or ``None`` for identity. ``convention="grid"`` is the
-    half-pixel / anti-aliased policy of :func:`_axis_weights`; ``"scipy"`` is the exact
+    """``(w, cubic)`` for one axis, or ``None`` for identity. ``convention="center"`` is the
+    half-pixel / anti-aliased policy of :func:`_axis_weights`; ``"corner"`` is the exact
     ``ndimage.zoom`` operator (corner-aligned, no anti-aliasing, honors ``order``/``mode``)."""
     if n_in == n_out:
         return None
-    if convention == "scipy":
+    if convention == "corner":
         w = torch.as_tensor(_scipy_axis_matrix(int(n_in), int(n_out), int(order), str(mode)), device=device, dtype=dtype)
         return w, order >= 2
-    if convention != "grid":
-        raise ValueError(f"unknown convention {convention!r}; expected 'grid' or 'scipy'")
+    if convention != "center":
+        raise ValueError(f"unknown convention {convention!r}; expected 'center' or 'corner'")
     return _axis_weights(n_in, n_out, aa_threshold, device, dtype)
 
 
@@ -161,7 +161,7 @@ def _separable_resample(
     new_shape: Tuple[int, int, int],
     aa_threshold: float,
     clamp_range: bool = True,
-    convention: str = "grid",
+    convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
 ) -> torch.Tensor:
@@ -178,8 +178,8 @@ def _separable_resample(
         if cubic:
             did_cubic = True
         out = _resample_axis(out, sp_axis + 1, w)
-    # scipy never clamps; clipping is part of the anti-aliased ("grid") policy only.
-    if clamp_range and did_cubic and convention == "grid":
+    # scipy never clamps; clipping is part of the anti-aliased ("center") policy only.
+    if clamp_range and did_cubic and convention == "center":
         # Clip cubic ringing to the input's value range (interior sharpness kept).
         lo = data.amin()
         hi = data.amax()
@@ -197,31 +197,37 @@ def resample_aa_torch(
     aa_threshold: float = 1.1,
     seg_resample_chunk_labels: int = 64,
     channel_chunk: int = 8,
-    convention: str = "grid",
+    convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
     **kwargs,
 ) -> Union[torch.Tensor, np.ndarray]:
     """GPU separable resample. ``data`` must be ``(c, x, y, z)``.
 
-    Two sampling conventions, selected with ``convention``:
+    Two sampling conventions, selected with ``convention`` and named by where the value
+    sits in its voxel:
 
-    * ``"grid"`` (default) - half-pixel centers (``align_corners=False``, the
-      skimage / ``F.interpolate`` / nnU-Net-native convention), anti-aliased
-      Catmull-Rom when downsampling by more than ``aa_threshold``, linear otherwise.
+    * ``"center"`` (default) - voxel-center: the value sits at the center of a cell that
+      tiles the field of view, so output sample ``j`` reads input coordinate
+      ``(j + 0.5) * n_in/n_out - 0.5`` (half-pixel, ``align_corners=False``; skimage
+      ``resize``, ``F.interpolate``, ITK, nnU-Net's own resampler). Anti-aliased
+      Catmull-Rom when downsampling by more than ``aa_threshold``, linear otherwise;
       ``order`` / ``mode`` are ignored.
-    * ``"scipy"`` - the exact operator of ``scipy.ndimage.zoom(order=order, mode=mode)``
-      (corner-aligned ``j*(n_in-1)/(n_out-1)``, spline prefilter, no anti-aliasing), the
-      convention TotalSegmentator's ``change_spacing`` uses. Results match scipy to float
-      precision on CPU (float64 in -> float64 math) and to ~1e-4 relative on MPS/CUDA
-      (float32). Integer inputs are rounded half-away-from-zero on output, as scipy does.
-      ``is_seg=True`` with ``order=0`` is an exact ``zoom(order=0)`` nearest-neighbor
-      label gather; higher orders use one-hot + argmax with the same operator.
+    * ``"corner"`` - voxel-corner point grid, exactly as ``scipy.ndimage.zoom(order=order,
+      mode=mode, grid_mode=False)``: values are points at ``i * spacing`` and the rescale
+      preserves the span of those points, ``j * (n_in-1)/(n_out-1)`` (``align_corners=True``;
+      TotalSegmentator's ``change_spacing``). Spline prefilter, no anti-aliasing. Results
+      match scipy to float precision on CPU (float64 in -> float64 math) and to ~1e-4
+      relative on MPS/CUDA (float32); integer inputs are rounded half-away-from-zero as
+      scipy does; ``is_seg=True, order=0`` is the exact ``zoom(order=0)`` label gather.
+      A corner-sampled grid that preserved the *cell* extent instead (``j * n_in/n_out``,
+      the spacing-exact convention some fused kernels use) differs by ``(n-1)/n`` per axis;
+      that is a third convention, not offered here.
 
     Anti-aliasing at inference is a distribution shift for models trained with the
     scipy/skimage resamplers (it lowers recall on sub-centimeter structures), so use
-    ``"grid"`` with AA only for models trained with it; for existing TotalSegmentator
-    models use ``convention="scipy"``.
+    ``"center"`` with AA only for models trained with it; for existing TotalSegmentator
+    models use ``convention="corner"``.
 
     Signature-compatible with nnU-Net's ``resampling_fn_data`` /
     ``resampling_fn_seg`` / ``resampling_fn_probabilities`` (extra plans kwargs
@@ -251,7 +257,7 @@ def resample_aa_torch(
 
     # float64 math on CPU for scipy parity when the input is float64; float32 elsewhere.
     is_f64 = (data.dtype == np.float64) if input_was_numpy else (data.dtype == torch.float64)
-    work = torch.float64 if (convention == "scipy" and device.type == "cpu" and is_f64) else torch.float32
+    work = torch.float64 if (convention == "corner" and device.type == "cpu" and is_f64) else torch.float32
     with torch.no_grad():
         if input_was_numpy:
             t = torch.as_tensor(np.ascontiguousarray(data)).to(device)
@@ -279,7 +285,7 @@ def resample_aa_torch(
 
         if input_was_numpy:
             r = result.cpu().numpy()
-            if convention == "scipy" and np.issubdtype(data.dtype, np.integer) and not is_seg:
+            if convention == "corner" and np.issubdtype(data.dtype, np.integer) and not is_seg:
                 r = np.where(r > 0, r + 0.5, r - 0.5)      # scipy's integer-output rounding
             result = r.astype(data.dtype, copy=False)
         else:
@@ -291,9 +297,9 @@ def resample_aa_torch(
 
 def scipy_zoom_torch(data, new_shape, order: int = 3, mode: str = "nearest", device=None, is_seg: bool = False):
     """``scipy.ndimage.zoom`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``.
-    Convenience wrapper for ``resample_aa_torch(..., convention="scipy")``."""
+    Convenience wrapper for ``resample_aa_torch(..., convention="corner")``."""
     return resample_aa_torch(data, new_shape, is_seg=is_seg, device=device,
-                             convention="scipy", order=order, mode=mode)
+                             convention="corner", order=order, mode=mode)
 
 
 def _resample_seg(
@@ -301,7 +307,7 @@ def _resample_seg(
     new_shape: Tuple[int, int, int],
     aa_threshold: float,
     chunk_labels: int,
-    convention: str = "grid",
+    convention: str = "center",
     order: int = 3,
     mode: str = "nearest",
 ) -> torch.Tensor:
@@ -312,7 +318,7 @@ def _resample_seg(
     chunks to bound memory; assumes a single channel (C == 1), as nnU-Net seg.
     """
     assert data.shape[0] == 1, "seg resampling expects a single channel"
-    if convention == "scipy" and order == 0:
+    if convention == "corner" and order == 0:
         # exact nearest-neighbor gather of scipy.ndimage.zoom(order=0)
         out = data
         for sp_axis in range(3):

@@ -113,7 +113,7 @@ def test_scipy_parity_float64_cpu():
         for order in (0, 1, 3):
             for mode in ("nearest", "mirror"):
                 ref = ndimage.zoom(vol[0], np.array(new_shape) / np.array(vol.shape[1:]), order=order, mode=mode)
-                out = resample_aa_torch(vol, new_shape, device="cpu", convention="scipy", order=order, mode=mode)[0]
+                out = resample_aa_torch(vol, new_shape, device="cpu", convention="corner", order=order, mode=mode)[0]
                 err = float(np.abs(out - ref).max())
                 check(f"scipy parity f64 cpu {new_shape} order={order} mode={mode}", err < 1e-6, f"max|d|={err:.2e}")
 
@@ -126,7 +126,7 @@ def test_scipy_parity_float32_gpu():
     for new_shape in [(21, 27, 70), (48, 60, 44)]:
         for order in (1, 3):
             ref = ndimage.zoom(vol[0], np.array(new_shape) / np.array(vol.shape[1:]), order=order, mode="nearest")
-            out = resample_aa_torch(vol.astype(np.float32), new_shape, device=DEV, convention="scipy", order=order)[0]
+            out = resample_aa_torch(vol.astype(np.float32), new_shape, device=DEV, convention="corner", order=order)[0]
             err = float(np.abs(out.astype(np.float64) - ref).max())
             check(f"scipy parity f32 {DEV.type} {new_shape} order={order}", err < 2e-2, f"max|d|={err:.2e} (HU-scale values)")
 
@@ -135,7 +135,7 @@ def test_scipy_parity_int16_rounding():
     from scipy import ndimage
     vol = _rand_vol((1, 30, 34, 28)).astype(np.int16)
     ref = ndimage.zoom(vol[0], np.array((13, 61, 28)) / np.array(vol.shape[1:]), order=3, mode="nearest")
-    out = resample_aa_torch(vol, (13, 61, 28), device="cpu", convention="scipy", order=3)[0]
+    out = resample_aa_torch(vol, (13, 61, 28), device="cpu", convention="corner", order=3)[0]
     same = float((out == ref).mean())
     check("scipy parity int16 (scipy rounding)", out.dtype == np.int16 and same > 0.999, f"dtype={out.dtype} identical={same:.5f}")
 
@@ -146,10 +146,10 @@ def test_scipy_seg_nearest_exact():
     seg = rng.integers(0, 120, size=(1, 31, 29, 35)).astype(np.int16)
     for new_shape in [(14, 67, 35), (62, 58, 70)]:
         ref = ndimage.zoom(seg[0], np.array(new_shape) / np.array(seg.shape[1:]), order=0, mode="nearest")
-        out = resample_aa_torch(seg, new_shape, is_seg=True, device="cpu", convention="scipy", order=0)[0]
+        out = resample_aa_torch(seg, new_shape, is_seg=True, device="cpu", convention="corner", order=0)[0]
         check(f"scipy seg NN exact {new_shape} cpu", np.array_equal(out.astype(np.int64), ref.astype(np.int64)), "label mismatch")
         if DEV.type != "cpu":
-            outg = resample_aa_torch(seg, new_shape, is_seg=True, device=DEV, convention="scipy", order=0)[0]
+            outg = resample_aa_torch(seg, new_shape, is_seg=True, device=DEV, convention="corner", order=0)[0]
             check(f"scipy seg NN exact {new_shape} {DEV.type}", np.array_equal(outg.astype(np.int64), ref.astype(np.int64)), "label mismatch")
 
 
@@ -164,8 +164,8 @@ def test_scipy_zoom_torch_wrapper():
 def test_grid_default_unchanged():
     vol = _rand_vol((1, 40, 52, 36)).astype(np.float32)
     a = resample_aa_torch(vol, (17, 23, 61), device="cpu")[0]
-    b = resample_aa_torch(vol, (17, 23, 61), device="cpu", convention="grid")[0]
-    check("grid default unchanged", np.array_equal(a, b), "")
+    b = resample_aa_torch(vol, (17, 23, 61), device="cpu", convention="center")[0]
+    check("center (default) unchanged", np.array_equal(a, b), "")
 
 
 if __name__ == "__main__":

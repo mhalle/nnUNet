@@ -100,17 +100,23 @@ Quality / correctness (`scripts/test_resample_gpu_aa.py`, 12 checks):
 > value of `resample_aa_torch` is anti-aliased downsampling that runs on the GPU,
 > at 24-40x the nnU-Net scipy default that ships in stock plans.
 
-## Sampling conventions: `convention="grid"` vs `convention="scipy"`
+## Sampling conventions: `convention="center"` vs `convention="corner"`
 
 Two resamplers can agree on "linear" or "cubic" and still disagree about *where* the
-output samples sit. `resample_aa_torch` exposes both conventions in use in the ecosystem:
+output samples sit. `resample_aa_torch` names the two conventions by where the value
+sits in its voxel:
 
-| `convention` | output sample `j` maps to input coordinate | anti-aliasing | matches |
-|---|---|---|---|
-| `"grid"` (default) | `(j + 0.5) * n_in/n_out - 0.5` - half-pixel / cell-centered (`align_corners=False`) | Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, nnU-Net's own `resample_data_or_seg_to_shape` |
-| `"scipy"` | `j * (n_in - 1) / (n_out - 1)` - corner-aligned (`grid_mode=False`) | none; `order` / `mode` honored | `scipy.ndimage.zoom`, i.e. TotalSegmentator's `change_spacing` |
+| `convention` | model | output sample `j` reads input coordinate | anti-aliasing | matches |
+|---|---|---|---|---|
+| `"center"` (default) | **voxel-center**: value at the center of a cell; cells tile the field of view | `(j + 0.5) * n_in/n_out - 0.5` (half-pixel, `align_corners=False`) | Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, ITK, nnU-Net's own `resample_data_or_seg_to_shape` |
+| `"corner"` | **voxel-corner point grid**: values are points at `i * spacing`; the rescale preserves the *span of the points* | `j * (n_in - 1) / (n_out - 1)` (`align_corners=True`, `grid_mode=False`) | none; `order` / `mode` honored | `scipy.ndimage.zoom`, i.e. TotalSegmentator's `change_spacing` |
 
-`"scipy"` is implemented by **probing `ndimage.zoom` itself**: the resampler is linear and
+A corner-sampled grid that preserved the *cell* extent instead (`j * n_in/n_out`, the
+spacing-exact convention some fused kernels use) differs from `"corner"` by a factor
+`(n-1)/n` per axis - 0.46 % here, up to ~2 native voxels at the far edge of a 768-voxel
+axis. That is a third convention, not a variant of the second; it is not offered here.
+
+`"corner"` is implemented by **probing `ndimage.zoom` itself**: the resampler is linear and
 separable, so zooming an identity matrix along one axis yields that axis's exact
 `(n_out x n_in)` operator - spline prefilter, boundary `mode` and coordinate map included -
 which is then applied with the same per-axis matmul as the anti-aliased path. CPU float64
@@ -125,7 +131,7 @@ against TS stock from 0.995 to 0.888 (46/110 labels below 0.9). Anti-aliasing on
 changed the mean only to 0.875 - but erased two sub-centimeter structures entirely
 (gallbladder, adrenal), because the model was trained on scipy's aliased-but-sharp inputs.
 Hence: **match the host pipeline's convention exactly, and treat anti-aliasing as opt-in
-for models trained with it.** `convention="scipy", order=3, mode="nearest"` reproduces
+for models trained with it.** `convention="corner", order=3, mode="nearest"` reproduces
 `change_spacing(order=3)` and reaches Dice 0.9966 against stock, at the re-run floor (0.9987).
 
 ```python
