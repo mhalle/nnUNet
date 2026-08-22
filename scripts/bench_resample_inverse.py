@@ -9,8 +9,8 @@ import numpy as np
 import torch
 
 from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
-from nnunetv2.preprocessing.resampling.resample_gpu_aa import (
-    resample_aa_torch, _separable_resample, _best_device)
+from nnunetv2.preprocessing.resampling.resample_gpu import (
+    resample_data_or_seg_to_shape_gpu, _separable_resample, _best_device)
 
 DEV = _best_device()
 
@@ -48,7 +48,7 @@ def inverse_probabilities():
         resample_data_or_seg_to_shape(logits, ag, [1.5]*3, [1.0]*3, is_seg=False, order=1)
         dt_s = time.perf_counter() - t0
         lt = torch.as_tensor(logits).to(DEV)
-        dt_a = t_dev(lambda z: resample_aa_torch(z, ag, device=DEV, channel_chunk=8), lt, reps=2)
+        dt_a = t_dev(lambda z: resample_data_or_seg_to_shape_gpu(z, ag, device=DEV, channel_chunk=8), lt, reps=2)
         outsz = K * float(np.prod(ag)) * 4 / 1e6
         print(f"  K={K:3d}  {mg} -> {ag}  (out {outsz:.0f} MB)")
         print(f"      scipy order-1 per-chan (CPU)  {dt_s*1000:8.1f} ms")

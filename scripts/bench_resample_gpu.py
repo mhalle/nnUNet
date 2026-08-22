@@ -1,4 +1,4 @@
-"""Benchmark + correctness: resample_aa_torch vs upstream resamplers.
+"""Benchmark + correctness: resample_data_or_seg_to_shape_gpu vs upstream resamplers.
 
 Compares the new GPU anti-aliased resampler against:
   * scipy default  (resample_data_or_seg_to_shape, order=3, anti_aliasing=False)
@@ -8,7 +8,7 @@ on (a) wall-time, (b) numeric agreement on an upsample (linear) case, and
 (c) aliasing on a synthetic high-frequency pattern when downsampling.
 
 Usage:
-  uv run python scripts/bench_resample_gpu_aa.py [path_to_nii] [target_mm]
+  uv run python scripts/bench_resample_gpu.py [path_to_nii] [target_mm]
 """
 import sys
 import time
@@ -19,7 +19,7 @@ import torch
 from nnunetv2.preprocessing.resampling.default_resampling import (
     resample_data_or_seg_to_shape, compute_new_shape)
 from nnunetv2.preprocessing.resampling.resample_torch import resample_torch_fornnunet
-from nnunetv2.preprocessing.resampling.resample_gpu_aa import resample_aa_torch, _best_device
+from nnunetv2.preprocessing.resampling.resample_gpu import resample_data_or_seg_to_shape_gpu, _best_device
 
 DEV = _best_device()
 
@@ -82,7 +82,7 @@ def bench_real(path, target_mm):
                             is_seg=False, device=torch.device("cpu"))
     report("torch trilinear (CPU*)", dt_t, out_t, ref=(ref,))
 
-    dt_a, out_a = time_call(resample_aa_torch, data, new_shape, spacing, new_spacing,
+    dt_a, out_a = time_call(resample_data_or_seg_to_shape_gpu, data, new_shape, spacing, new_spacing,
                             is_seg=False, device=DEV)
     report(f"AA cubic/linear ({DEV.type.upper()})", dt_a, out_a, ref=(ref,))
 
@@ -103,7 +103,7 @@ def aliasing_test():
 
     _, out_t = time_call(resample_torch_fornnunet, data, new_shape, [1,1,1], [4,1,1],
                          is_seg=False, device=torch.device("cpu"), reps=1)
-    _, out_a = time_call(resample_aa_torch, data, new_shape, [1,1,1], [4,1,1],
+    _, out_a = time_call(resample_data_or_seg_to_shape_gpu, data, new_shape, [1,1,1], [4,1,1],
                          is_seg=False, device=DEV, reps=1)
     ot = out_t[0].cpu().numpy() if isinstance(out_t, torch.Tensor) else out_t[0]
     oa = out_a[0].cpu().numpy() if isinstance(out_a, torch.Tensor) else out_a[0]
@@ -120,7 +120,7 @@ def upsample_agreement():
     new_shape = (80, 100, 120)
     _, out_t = time_call(resample_torch_fornnunet, data, new_shape, [2,2,2], [1,1,1],
                          is_seg=False, device=torch.device("cpu"), reps=1)
-    _, out_a = time_call(resample_aa_torch, data, new_shape, [2,2,2], [1,1,1],
+    _, out_a = time_call(resample_data_or_seg_to_shape_gpu, data, new_shape, [2,2,2], [1,1,1],
                          is_seg=False, device=DEV, reps=1)
     ot = out_t[0].cpu().numpy() if isinstance(out_t, torch.Tensor) else out_t[0]
     oa = out_a[0].cpu().numpy() if isinstance(out_a, torch.Tensor) else out_a[0]

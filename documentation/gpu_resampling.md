@@ -1,10 +1,10 @@
-# GPU anti-aliased resampling (`resample_aa_torch`)
+# GPU resampling (`resample_data_or_seg_to_shape_gpu`)
 
-A drop-in resampling function for nnU-Net that runs on **MPS / CUDA / CPU** and
-**anti-aliases when downsampling** - two things the existing resamplers do not
-both do.
+A drop-in resampling function for nnU-Net that runs on **MPS / CUDA / CPU**, gives the
+same results as `resample_data_or_seg_to_shape` by default, and can anti-alias when
+downsampling (`anti_alias=True`) - the existing resamplers do neither.
 
-Module: `nnunetv2/preprocessing/resampling/resample_gpu_aa.py`
+Module: `nnunetv2/preprocessing/resampling/resample_gpu.py`
 
 ## Why
 
@@ -15,7 +15,7 @@ downsampler:
 |---|---|---|
 | `resample_data_or_seg_to_shape` (scipy, **default**) | CPU only | no (`anti_aliasing=False`, order-3 spline) |
 | `resample_torch_fornnunet` (`F.interpolate`) | CPU only for 3-D* | no |
-| **`resample_aa_torch` (this)** | **MPS / CUDA / CPU** | **yes** |
+| **`resample_data_or_seg_to_shape_gpu` (this)** | **MPS / CUDA / CPU** | **yes** |
 
 \* `aten::upsample_trilinear3d` is **not implemented for MPS** in current
 PyTorch, so the torch resampler silently cannot use Apple-Silicon GPUs for 3-D
@@ -61,11 +61,11 @@ functions at this one and pass a device:
 
 ```jsonc
 // in plans.json, per configuration:
-"resampling_fn_data":          "resample_aa_torch",
+"resampling_fn_data":          "resample_data_or_seg_to_shape_gpu",
 "resampling_fn_data_kwargs":   {"device": "mps"},
-"resampling_fn_seg":           "resample_aa_torch",
+"resampling_fn_seg":           "resample_data_or_seg_to_shape_gpu",
 "resampling_fn_seg_kwargs":    {"is_seg": true, "device": "mps"},
-"resampling_fn_probabilities": "resample_aa_torch",
+"resampling_fn_probabilities": "resample_data_or_seg_to_shape_gpu",
 "resampling_fn_probabilities_kwargs": {"device": "mps", "channel_chunk": 8}
 ```
 
@@ -75,10 +75,10 @@ accepted and ignored.
 
 ## Benchmarks (M2, 16 GB, MPS)
 
-`scripts/bench_resample_gpu_aa.py` (forward + quality) and
+`scripts/bench_resample_gpu.py` (forward + quality) and
 `scripts/bench_resample_inverse.py` (device-resident + K-channel):
 
-| path | scipy default (CPU) | `resample_aa_torch` (MPS) | speedup |
+| path | scipy default (CPU) | `resample_data_or_seg_to_shape_gpu` (MPS) | speedup |
 |---|---|---|---|
 | forward `512^2x165 -> 227^2x220` | 3.8 s | 95 ms | **40x** |
 | forward `768^2x709 -> 333^2x473` | 27.4 s | 1.1 s | **24x** |
@@ -86,7 +86,7 @@ accepted and ignored.
 | inverse K=50  `-> 128^2x160` | 4.2 s | 118 ms | **36x** |
 | inverse K=117 `112^2x128 -> 192^2x224` | 32.2 s | 0.87 s | **37x** |
 
-Quality / correctness (`scripts/test_resample_gpu_aa.py`, 12 checks):
+Quality / correctness (`scripts/test_resample_gpu.py`, 12 checks):
 
 * upsample (linear) matches `F.interpolate` trilinear to `max|delta| ~ 3e-5`;
 * 8x downsample of zero-mean high-frequency noise: AA output std **24.5** vs
@@ -97,12 +97,12 @@ Quality / correctness (`scripts/test_resample_gpu_aa.py`, 12 checks):
 
 > Note: `F.interpolate(trilinear)` on **CPU** is itself very fast (~60 ms on the
 > chest volume) - but it has no anti-aliasing and cannot run on MPS for 3-D. The
-> value of `resample_aa_torch` is anti-aliased downsampling that runs on the GPU,
+> value of `resample_data_or_seg_to_shape_gpu` is anti-aliased downsampling that runs on the GPU,
 > at 24-40x the nnU-Net scipy default that ships in stock plans.
 
 ## Defaults: nnU-Net's own resampler, on the GPU
 
-With the defaults (`convention="center"`, `anti_alias=False`) `resample_aa_torch` is
+With the defaults (`convention="center"`, `anti_alias=False`) `resample_data_or_seg_to_shape_gpu` is
 `resample_data_or_seg_to_shape` on MPS / CUDA / CPU: skimage `resize(order, mode="edge",
 anti_aliasing=False)` semantics for data - voxel-center sampling, spline prefilter and
 skimage's per-channel clip to the input range - and nnU-Net's own label rule for
@@ -123,12 +123,12 @@ operator with a different order per axis, plus upstream's two details: the per-s
 `(0.24, 1.25, 1.25)`) declines to separate exactly as upstream does. Verified against
 `resample_data_or_seg_to_shape` for orders 0/1/3 x `order_z` 0/1/3, both axes, forced
 on/off: data to 1e-12 (CPU), labels bit-identical (CPU and MPS). 94 checks in
-`scripts/test_resample_gpu_aa.py`.
+`scripts/test_resample_gpu.py`.
 
 ## Sampling conventions: `convention="center"` vs `convention="corner"`
 
 Two resamplers can agree on "linear" or "cubic" and still disagree about *where* the
-output samples sit. `resample_aa_torch` names the two conventions by where the value
+output samples sit. `resample_data_or_seg_to_shape_gpu` names the two conventions by where the value
 sits in its voxel:
 
 | `convention` | model | output sample `j` reads input coordinate | anti-aliasing | matches |
@@ -160,10 +160,10 @@ for models trained with it.** `convention="corner", order=3, mode="nearest"` rep
 `change_spacing(order=3)` and reaches Dice 0.9966 against stock, at the re-run floor (0.9987).
 
 ```python
-from nnunetv2.preprocessing.resampling.resample_gpu_aa import resample_aa_torch, scipy_zoom_torch, skimage_resize_torch
+from nnunetv2.preprocessing.resampling.resample_gpu import resample_data_or_seg_to_shape_gpu, scipy_zoom_torch, skimage_resize_torch
 
-nnunet  = resample_aa_torch(data[None], new_shape, device="mps")[0]                           # == nnU-Net's resampler (skimage, voxel-center)
+nnunet  = resample_data_or_seg_to_shape_gpu(data[None], new_shape, device="mps")[0]                           # == nnU-Net's resampler (skimage, voxel-center)
 img3mm  = scipy_zoom_torch(data[None], new_shape, order=3, mode="nearest", device="mps")[0]   # == ndimage.zoom (voxel-corner, TotalSegmentator)
 labels  = scipy_zoom_torch(seg[None], native_shape, order=0, is_seg=True, device="mps")[0]   # == zoom(order=0)
-aa_img  = resample_aa_torch(data[None], new_shape, device="mps", anti_alias=True)[0]          # anti-aliased policy (opt-in)
+aa_img  = resample_data_or_seg_to_shape_gpu(data[None], new_shape, device="mps", anti_alias=True)[0]          # anti-aliased policy (opt-in)
 ```

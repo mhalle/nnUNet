@@ -275,7 +275,7 @@ def _separate_z_seg(t: torch.Tensor, new_shape, axis: int, order: int, order_z: 
     return out
 
 
-def resample_aa_torch(
+def resample_data_or_seg_to_shape_gpu(
     data: Union[torch.Tensor, np.ndarray],
     new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
     current_spacing: Union[Tuple[float, ...], List[float], np.ndarray] = None,
@@ -379,7 +379,7 @@ def resample_aa_torch(
             sep_axis = None if sep_axis is None else int(sep_axis)
         elif force_separate_z:
             raise ValueError("force_separate_z=True needs current_spacing to pick the low-resolution axis")
-    work = torch.float64 if (exact and device.type == "cpu" and is_f64) else torch.float32
+    work = torch.float64 if (device.type == "cpu" and is_f64) else torch.float32    # float64 math on CPU for float64 input
     with torch.no_grad():
         if input_was_numpy:
             t = torch.as_tensor(np.ascontiguousarray(data)).to(device)
@@ -428,14 +428,14 @@ def resample_aa_torch(
 def skimage_resize_torch(data, new_shape, order: int = 3, device=None, is_seg: bool = False):
     """skimage ``resize(order, mode="edge", anti_aliasing=False)`` / nnU-Net
     ``resample_data_or_seg_to_shape`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``."""
-    return resample_aa_torch(data, new_shape, is_seg=is_seg, device=device,
+    return resample_data_or_seg_to_shape_gpu(data, new_shape, is_seg=is_seg, device=device,
                              convention="center", order=order, mode="nearest", anti_alias=False)
 
 
 def scipy_zoom_torch(data, new_shape, order: int = 3, mode: str = "nearest", device=None, is_seg: bool = False):
     """``scipy.ndimage.zoom`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``.
-    Convenience wrapper for ``resample_aa_torch(..., convention="corner")``."""
-    return resample_aa_torch(data, new_shape, is_seg=is_seg, device=device,
+    Convenience wrapper for ``resample_data_or_seg_to_shape_gpu(..., convention="corner")``."""
+    return resample_data_or_seg_to_shape_gpu(data, new_shape, is_seg=is_seg, device=device,
                              convention="corner", order=order, mode=mode)
 
 
@@ -503,9 +503,9 @@ if __name__ == "__main__":
     # quick smoke test
     x = torch.zeros(1, 64, 128, 128)
     x[:, 16:48, 32:96, 32:96] = 1000.0
-    out = resample_aa_torch(x, (32, 64, 64), device="cpu")
+    out = resample_data_or_seg_to_shape_gpu(x, (32, 64, 64), device="cpu")
     print("data:", x.shape, "->", out.shape, "range", float(out.min()), float(out.max()))
     seg = torch.zeros(1, 64, 128, 128, dtype=torch.int16)
     seg[:, 16:48, 32:96, 32:96] = 3
-    outs = resample_aa_torch(seg, (32, 64, 64), is_seg=True, device="cpu")
+    outs = resample_data_or_seg_to_shape_gpu(seg, (32, 64, 64), is_seg=True, device="cpu")
     print("seg:", seg.shape, "->", outs.shape, "labels", torch.unique(outs).tolist())
