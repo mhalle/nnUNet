@@ -196,6 +196,85 @@ def _separable_resample(
     return out
 
 
+def _center_axis_matrix_t(n_in, n_out, order, mode, device, dtype):
+    return torch.as_tensor(_scipy_axis_matrix(int(n_in), int(n_out), int(order), str(mode), True), device=device, dtype=dtype)
+
+
+def _nn_gather_center(t: torch.Tensor, dim: int, n_out: int, mode: str) -> torch.Tensor:
+    """Exact nearest-neighbor gather of zoom(order=0, grid_mode=True) along tensor dim ``dim``."""
+    n_in = t.shape[dim]
+    if n_in == n_out:
+        return t
+    idx = torch.as_tensor(_scipy_nn_index(int(n_in), int(n_out), str(mode), True), device=t.device)
+    return t.index_select(dim, idx)
+
+
+def _separate_z_data(t: torch.Tensor, new_shape, axis: int, order: int, order_z: int, mode: str = "nearest") -> torch.Tensor:
+    """nnU-Net's separate-z data path, exactly: each slice along ``axis`` is skimage-resized
+    in-plane with ``order`` (clipped to that slice's input range, as resize(clip=True) does per
+    2-D call), then the low-resolution axis is resampled with ``order_z`` at half-pixel
+    positions (map_coordinates, mode='nearest'), with no further clip."""
+    out = t
+    inplane = [sp for sp in range(3) if sp != axis]
+    for sp in inplane:
+        n_in, n_out = out.shape[sp + 1], int(new_shape[sp])
+        if n_in != n_out:
+            out = _resample_axis(out, sp + 1, _center_axis_matrix_t(n_in, n_out, order, mode, t.device, t.dtype))
+    dims = tuple(sp + 1 for sp in inplane)
+    lo = t.amin(dim=dims, keepdim=True)
+    hi = t.amax(dim=dims, keepdim=True)
+    out = torch.maximum(torch.minimum(out, hi), lo)
+    n_in, n_out = out.shape[axis + 1], int(new_shape[axis])
+    if n_in != n_out:
+        if order_z == 0:
+            out = _nn_gather_center(out, axis + 1, n_out, mode)
+        else:
+            out = _resample_axis(out, axis + 1, _center_axis_matrix_t(n_in, n_out, order_z, mode, t.device, t.dtype))
+    return out
+
+
+def _separate_z_seg(t: torch.Tensor, new_shape, axis: int, order: int, order_z: int, chunk_labels: int, mode: str = "nearest") -> torch.Tensor:
+    """nnU-Net's separate-z label path, exactly: in-plane ``resize_segmentation`` per slice
+    (order 0: nearest; else per-label indicator resized with ``order``, painted where ``>= 0.5``
+    in ascending label order), then along ``axis`` with ``order_z`` (0: nearest gather of the
+    label values; else per-label indicator, painted where ``round(v) > 0.5`` i.e. ``v > 0.5``)."""
+    assert t.shape[0] == 1, "seg resampling expects a single channel"
+    inplane = [sp for sp in range(3) if sp != axis]
+    mid_shape = list(new_shape); mid_shape[axis] = t.shape[axis + 1]
+    unique = torch.unique(t)
+    result_dtype = torch.int16 if int(unique.max()) > 127 else torch.int8
+    if order == 0:
+        cur = t
+        for sp in inplane:
+            cur = _nn_gather_center(cur, sp + 1, int(new_shape[sp]), mode)
+        cur = cur.to(result_dtype)
+    else:
+        cur = torch.zeros((1, *mid_shape), dtype=result_dtype, device=t.device)
+        for start in range(0, len(unique), chunk_labels):
+            labs = unique[start:start + chunk_labels]
+            soft = (t[0][None] == labs.view(-1, 1, 1, 1)).float()
+            for sp in inplane:
+                n_in, n_out = soft.shape[sp + 1], int(new_shape[sp])
+                if n_in != n_out:
+                    soft = _resample_axis(soft, sp + 1, _center_axis_matrix_t(n_in, n_out, order, mode, t.device, soft.dtype))
+            for i in range(len(labs)):
+                cur[0][soft[i] >= 0.5] = labs[i].to(result_dtype)
+    n_in, n_out = cur.shape[axis + 1], int(new_shape[axis])
+    if n_in == n_out:
+        return cur
+    if order_z == 0:
+        return _nn_gather_center(cur, axis + 1, n_out, mode)
+    unique2 = torch.unique(cur)
+    out = torch.zeros((1, *new_shape), dtype=result_dtype, device=t.device)
+    for start in range(0, len(unique2), chunk_labels):
+        labs = unique2[start:start + chunk_labels]
+        soft = (cur[0][None] == labs.view(-1, 1, 1, 1)).float()
+        soft = _resample_axis(soft, axis + 1, _center_axis_matrix_t(n_in, n_out, order_z, mode, t.device, soft.dtype))
+        for i in range(len(labs)):
+            out[0][soft[i] > 0.5] = labs[i].to(result_dtype)
+    return out
+
+
 def resample_aa_torch(
     data: Union[torch.Tensor, np.ndarray],
     new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
@@ -210,6 +289,9 @@ def resample_aa_torch(
     order: int = 3,
     mode: str = "nearest",
     anti_alias: bool = False,
+    order_z: int = 0,
+    force_separate_z: Union[bool, None] = False,
+    separate_z_anisotropy_threshold: float = None,
     **kwargs,
 ) -> Union[torch.Tensor, np.ndarray]:
     """GPU separable resample. ``data`` must be ``(c, x, y, z)``.
@@ -221,10 +303,14 @@ def resample_aa_torch(
     MPS/CUDA (float32): voxel-center sampling, spline prefilter, skimage's per-channel clip to
     the input range, and for ``is_seg=True`` nnU-Net's own label rule (each label's resized
     indicator thresholded at 0.5 and painted in ascending label order; ``order=0`` is an exact
-    nearest-neighbor gather). Not replicated: nnU-Net's *separate-z* policy for strongly
-    anisotropic spacing (anisotropy > 3, or ``force_separate_z``), which resamples the
-    low-resolution axis with ``order_z`` by a different code path; ``order_z`` and
-    ``force_separate_z`` are accepted and ignored.
+    nearest-neighbor gather). nnU-Net's *separate-z* policy is replicated too: when
+    ``current_spacing`` / ``new_spacing`` are given and the data are anisotropic beyond
+    ``separate_z_anisotropy_threshold`` (nnU-Net's ``ANISO_THRESHOLD``, 3) - or when
+    ``force_separate_z`` - the in-plane axes are resampled with ``order`` (per-slice clip, as
+    skimage does per 2-D call) and the low-resolution axis with ``order_z``, labels included
+    (in-plane ``>= 0.5`` rule, along-axis ``> 0.5`` rule, exactly as upstream). The decision
+    itself is upstream's ``determine_do_sep_z_and_axis``. Without spacing information no
+    separate-z is performed (upstream always passes it).
 
     Two sampling conventions, selected with ``convention`` and named by where the value
     sits in its voxel:
@@ -282,6 +368,17 @@ def resample_aa_torch(
     # float64 math on CPU for scipy parity when the input is float64; float32 elsewhere.
     is_f64 = (data.dtype == np.float64) if input_was_numpy else (data.dtype == torch.float64)
     exact = convention == "corner" or not anti_alias
+    # nnU-Net's separate-z decision (only meaningful for the exact voxel-center operator)
+    do_separate_z, sep_axis = False, None
+    if convention == "center" and not anti_alias:
+        if current_spacing is not None and new_spacing is not None:
+            from nnunetv2.configuration import ANISO_THRESHOLD
+            from nnunetv2.preprocessing.resampling.default_resampling import determine_do_sep_z_and_axis
+            thr = ANISO_THRESHOLD if separate_z_anisotropy_threshold is None else separate_z_anisotropy_threshold
+            do_separate_z, sep_axis = determine_do_sep_z_and_axis(force_separate_z, current_spacing, new_spacing, thr)
+            sep_axis = None if sep_axis is None else int(sep_axis)
+        elif force_separate_z:
+            raise ValueError("force_separate_z=True needs current_spacing to pick the low-resolution axis")
     work = torch.float64 if (exact and device.type == "cpu" and is_f64) else torch.float32
     with torch.no_grad():
         if input_was_numpy:
@@ -289,7 +386,15 @@ def resample_aa_torch(
         else:
             t = data.to(device)
 
-        if is_seg:
+        if do_separate_z and is_seg:
+            result = _separate_z_seg(t, new_shape, sep_axis, order, order_z, seg_resample_chunk_labels, mode)
+        elif do_separate_z:
+            C = t.shape[0]
+            result = torch.empty((C, *new_shape), dtype=work, device=device)
+            for s in range(0, C, channel_chunk):
+                e = min(s + channel_chunk, C)
+                result[s:e] = _separate_z_data(t[s:e].to(work), new_shape, sep_axis, order, order_z, mode)
+        elif is_seg:
             result = _resample_seg(t, new_shape, aa_threshold, seg_resample_chunk_labels,
                                    convention=convention, order=order, mode=mode, anti_alias=anti_alias)
         elif t.shape[0] > channel_chunk:
@@ -347,8 +452,8 @@ def _resample_seg(
     """Label-preserving resample.
 
     * exact conventions with ``order=0``: the nearest-neighbor gather of ``zoom(order=0)``;
-    * ``"center"`` without anti-aliasing: nnU-Net's rule (``resample_data_or_seg``) - resize
-      each label's indicator, threshold at 0.5, paint in ascending label order (later labels
+    * ``"center"`` without anti-aliasing: nnU-Net's rule (``resize_segmentation``) - resize
+      each label's indicator, paint where ``>= 0.5`` in ascending label order (later labels
       overwrite; unpainted voxels are 0);
     * otherwise: one-hot -> separable resample -> argmax, in label chunks to bound memory.
     Assumes a single channel (C == 1), as nnU-Net seg.
@@ -374,7 +479,7 @@ def _resample_seg(
             soft = _separable_resample(onehot, new_shape, aa_threshold, clamp_range=False,
                                        convention=convention, order=order, mode=mode, anti_alias=False)
             for i in range(len(labs)):
-                out[0][soft[i] > 0.5] = labs[i].to(result_dtype)
+                out[0][soft[i] >= 0.5] = labs[i].to(result_dtype)     # resize_segmentation: >= 0.5
         return out
     best_val = None
     best_lab = None

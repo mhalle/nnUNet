@@ -209,6 +209,62 @@ def test_aa_policy_is_opt_in():
     check("anti_alias=True differs from the exact default on downsampling", not np.array_equal(a, b), "")
 
 
+def test_separate_z_parity_nnunet_data():
+    """Anisotropic spacing -> upstream's separate-z path; ours must match it exactly."""
+    vol = _rand_vol((2, 40, 44, 12))
+    cases = [  # (current_spacing, new_spacing, force) -> (in-plane down, z up 5x), axis 0 variant, no-sep tie, forced
+        ((0.7, 0.7, 5.0), (1.0, 1.0, 1.0), None),
+        ((5.0, 0.7, 0.7), (1.5, 1.5, 1.5), None),
+        ((0.24, 1.25, 1.25), (1.0, 1.0, 1.0), None),     # two low-res axes -> upstream does NOT separate
+        ((0.7, 0.7, 5.0), (1.0, 1.0, 1.0), True),
+        ((0.7, 0.7, 5.0), (1.0, 1.0, 1.0), False),
+    ]
+    for cur, new, force in cases:
+        new_shape = tuple(int(round(s * c / n)) for s, c, n in zip(vol.shape[1:], cur, new))
+        for order, order_z in ((3, 0), (1, 0), (3, 1), (3, 3)):
+            ref = resample_data_or_seg_to_shape(vol, new_shape, cur, new, is_seg=False, order=order, order_z=order_z, force_separate_z=force)
+            out = resample_aa_torch(vol, new_shape, cur, new, device="cpu", order=order, order_z=order_z, force_separate_z=force)
+            err = float(np.abs(out - ref).max())
+            check(f"separate-z data {cur}->{new} force={force} order={order} order_z={order_z}", err < 1e-6, f"max|d|={err:.2e}")
+    if DEV.type != "cpu":
+        cur, new = (0.7, 0.7, 5.0), (1.0, 1.0, 1.0)
+        new_shape = tuple(int(round(s * c / n)) for s, c, n in zip(vol.shape[1:], cur, new))
+        ref = resample_data_or_seg_to_shape(vol, new_shape, cur, new, is_seg=False, order=3, order_z=0, force_separate_z=None)
+        out = resample_aa_torch(vol.astype(np.float32), new_shape, cur, new, device=DEV, order=3, order_z=0, force_separate_z=None)
+        err = float(np.abs(out.astype(np.float64) - ref).max())
+        check(f"separate-z data f32 {DEV.type}", err < 2e-2, f"max|d|={err:.2e}")
+
+
+def test_separate_z_parity_nnunet_seg():
+    rng = np.random.default_rng(3)
+    seg = np.zeros((1, 40, 44, 12), dtype=np.int16)
+    for L in range(1, 9):
+        z, y, x = rng.integers(0, 24, 2).tolist() + [int(rng.integers(0, 6))]
+        seg[0, z:z + 14, y:y + 13, x:x + 5] = L
+    cur, new = (0.7, 0.7, 5.0), (1.0, 1.0, 1.0)
+    new_shape = tuple(int(round(s * c / n)) for s, c, n in zip(seg.shape[1:], cur, new))
+    for order, order_z, force in ((1, 0, None), (0, 0, None), (1, 1, True), (3, 3, True), (1, 0, False)):
+        ref = resample_data_or_seg_to_shape(seg, new_shape, cur, new, is_seg=True, order=order, order_z=order_z, force_separate_z=force)
+        out = resample_aa_torch(seg, new_shape, cur, new, is_seg=True, device="cpu", order=order, order_z=order_z, force_separate_z=force)
+        same = float((out.astype(np.int64) == ref.astype(np.int64)).mean())
+        check(f"separate-z seg order={order} order_z={order_z} force={force}", same == 1.0, f"identical={same:.6f}")
+        if DEV.type != "cpu":
+            outg = resample_aa_torch(seg, new_shape, cur, new, is_seg=True, device=DEV, order=order, order_z=order_z, force_separate_z=force)
+            same = float((outg.astype(np.int64) == ref.astype(np.int64)).mean())
+            check(f"separate-z seg order={order} order_z={order_z} force={force} {DEV.type}", same > 0.9999, f"identical={same:.6f}")
+
+
+def test_seg_threshold_exact_half():
+    """2x downsampling with order 1 produces indicator values of exactly 0.5: the >= rule must match."""
+    rng = np.random.default_rng(4)
+    seg = rng.integers(0, 5, size=(1, 32, 30, 28)).astype(np.int16)
+    sp = (1.0, 1.0, 1.0)
+    ref = resample_data_or_seg_to_shape(seg, (16, 15, 14), sp, sp, is_seg=True, order=1, order_z=0, force_separate_z=False)
+    out = resample_aa_torch(seg, (16, 15, 14), sp, sp, is_seg=True, device="cpu", order=1, force_separate_z=False)
+    same = float((out.astype(np.int64) == ref.astype(np.int64)).mean())
+    check("seg >= 0.5 rule at exact halves (2x down, order 1)", same == 1.0, f"identical={same:.6f}")
+
+
 if __name__ == "__main__":
     print(f"device={DEV}")
     for t in [test_noop, test_upsample_matches_trilinear, test_downsample_antialiases,
@@ -216,7 +272,8 @@ if __name__ == "__main__":
               test_channel_chunk_equiv, test_discoverable,
               test_scipy_parity_float64_cpu, test_scipy_parity_float32_gpu, test_scipy_parity_int16_rounding,
               test_scipy_seg_nearest_exact, test_scipy_zoom_torch_wrapper,
-              test_center_parity_nnunet, test_center_seg_parity_nnunet, test_aa_policy_is_opt_in]:
+              test_center_parity_nnunet, test_center_seg_parity_nnunet, test_aa_policy_is_opt_in,
+              test_separate_z_parity_nnunet_data, test_separate_z_parity_nnunet_seg, test_seg_threshold_exact_half]:
         t()
     n_ok, n = sum(PASS), len(PASS)
     print(f"\n{n_ok}/{n} checks passed")

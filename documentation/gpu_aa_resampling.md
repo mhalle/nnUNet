@@ -109,10 +109,21 @@ skimage's per-channel clip to the input range - and nnU-Net's own label rule for
 `is_seg=True` (each label's resized indicator thresholded at 0.5 and painted in ascending
 label order; `order=0` is an exact nearest-neighbor gather). Verified to 1e-12 on CPU
 (float64) and ~1e-3 on HU-scale data on MPS (float32); labels bit-identical on both.
-Anti-aliasing is opt-in (`anti_alias=True`), for models trained with it. Not replicated:
-nnU-Net's *separate-z* policy for strongly anisotropic spacing (anisotropy > 3 or
-`force_separate_z`), which resamples the low-resolution axis with `order_z` by a different
-code path - `order_z` / `force_separate_z` are accepted and ignored.
+Anti-aliasing is opt-in (`anti_alias=True`), for models trained with it.
+
+nnU-Net's **separate-z** policy is replicated as well. When `current_spacing` / `new_spacing`
+are passed (the preprocessor and the export step always pass them) and the data are
+anisotropic beyond `ANISO_THRESHOLD` (3) - or when `force_separate_z` - upstream resamples
+each slice in-plane with `order` and the low-resolution axis with `order_z` (0 in every
+standard plan, i.e. nearest) through a different code path. Here that is the same per-axis
+operator with a different order per axis, plus upstream's two details: the per-slice clip
+(skimage's `clip=True` per 2-D call) and the label rules (`>= 0.5` in-plane,
+`round(v) > 0.5` along the axis). The decision is upstream's own
+`determine_do_sep_z_and_axis`, so the tie case (two equally coarse axes, e.g.
+`(0.24, 1.25, 1.25)`) declines to separate exactly as upstream does. Verified against
+`resample_data_or_seg_to_shape` for orders 0/1/3 x `order_z` 0/1/3, both axes, forced
+on/off: data to 1e-12 (CPU), labels bit-identical (CPU and MPS). 94 checks in
+`scripts/test_resample_gpu_aa.py`.
 
 ## Sampling conventions: `convention="center"` vs `convention="corner"`
 
