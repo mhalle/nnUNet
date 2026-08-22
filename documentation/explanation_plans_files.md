@@ -78,6 +78,7 @@ nnunetv2.preprocessing.resampling
 resampling function must be callable(data, current_spacing, new_spacing, **kwargs). It must be located in
 nnunetv2.preprocessing.resampling
 - `resampling_fn_seg_kwargs`: kwargs for resampling_fn_seg
+- available resampling functions: `resample_data_or_seg_to_shape` (default; scipy/skimage on the CPU), `resample_torch_fornnunet` (`torch.nn.functional.interpolate`), and `resample_data_or_seg_to_shape_gpu` (the default's results on MPS / CUDA / CPU, see [gpu_resampling.md](gpu_resampling.md))
 - `network_arch_class_name`: UNet class name, can be used to integrate custom dynamic architectures
 - `UNet_base_num_features`: The number of starting features for the UNet architecture. Default is 32. Default: Features
 are doubled with each downsampling

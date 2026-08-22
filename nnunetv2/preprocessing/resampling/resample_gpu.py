@@ -1,53 +1,26 @@
-"""GPU anti-aliased separable resampling for nnU-Net (Torch, MPS/CUDA/CPU).
+"""GPU implementation of nnU-Net's default resampler.
 
-Drop-in replacement for ``resample_data_or_seg_to_shape`` /
-``resample_torch_fornnunet`` that addresses two gaps in the existing
-resamplers:
+``resample_data_or_seg_to_shape_gpu`` is ``resample_data_or_seg_to_shape`` on MPS / CUDA / CPU:
+same sampling convention, spline prefilter, per-channel clip, label rules and separate-z policy,
+verified against the original to float precision (see ``nnunetv2/tests/test_resample_gpu.py``).
+It is selected by name from ``plans.json`` like any other resampling function (planners in
+``experiment_planning/experiment_planners/resampling/resample_with_gpu.py``), and it is
+plain torch, so it runs on Apple Silicon where neither scipy nor ``F.interpolate``'s 3-D
+trilinear path can use the GPU.
 
-1. **Anti-aliasing on downsampling.** The scipy default
-   (``resample_data_or_seg``) sets ``anti_aliasing=False`` and relies on an
-   order-3 spline that does not band-limit; the torch path uses
-   ``F.interpolate(mode='trilinear', antialias=False)`` and *cannot* set
-   ``antialias=True`` at all (Torch supports the anti-alias flag only for the
-   2-D ``bilinear``/``bicubic`` modes, never for 3-D ``trilinear``). Either way,
-   shrinking a volume by a large factor undersamples - a 2-tap/order-3 kernel
-   sees far fewer than the ``f`` source voxels that map onto one output voxel,
-   so thin / high-contrast structure aliases.
-
-2. **GPU execution.** scipy resampling is CPU-bound and is the dominant cost of
-   nnU-Net preprocessing on Apple Silicon / single-GPU boxes. Everything here is
-   plain Torch ops (per-axis matmul), so it runs on ``mps`` / ``cuda``.
-
-Per-axis policy, keyed on the resample factor ``f = n_in / n_out`` for that axis:
-
-* ``f > aa_threshold`` (downsampling): factor-scaled Catmull-Rom cubic. The
-  kernel support is stretched by ``f`` so it averages the whole output-voxel
-  footprint - i.e. a genuine anti-aliasing prefilter, not point interpolation.
-* ``f <= aa_threshold`` (upsampling / near-identity): linear. Anti-aliasing
-  does not apply when upsampling, and cubic's negative lobes ring/overshoot at
-  high-contrast edges (e.g. inventing haloes between the sparse slices of
-  thick-slice CT when the through-plane axis is upsampled). Linear is monotone,
-  so it never invents values outside the data.
-
-This per-axis decision generalizes nnU-Net's ``do_separate_z`` special-case: an
-anisotropic through-plane axis that is being upsampled automatically gets the
-linear (non-ringing) treatment, while the in-plane axes that are being
-downsampled get the anti-aliased cubic - no explicit separate-z branch needed.
-
-Half-pixel-center sampling (``align_corners=False``), matching skimage ``resize``
-and ``F.interpolate``, so it is a faithful drop-in. Catmull-Rom's negative lobes
-can ring slightly past the data range at sharp edges; the cubic output is
-clipped to the input's value range to remove that overshoot while keeping
-interior sharpness (linear axes never ring, so the clip only ever touches cubic
-ones).
+Each axis is applied as a dense ``(n_out, n_in)`` matrix via matmul. The exact operators are
+obtained by probing ``scipy.ndimage.zoom`` with an identity matrix (the resampler is linear
+and separable, so the probe captures prefilter, boundary mode and coordinate map without
+re-implementing any of them); ``anti_alias=True`` swaps in a PIL-style anti-aliased policy
+(Catmull-Rom scaled by the factor), which is opt-in because models trained with the default
+resampler are not trained on anti-aliased inputs. See ``documentation/gpu_resampling.md``.
 """
-from typing import Union, Tuple, List, Optional
+from typing import Union, Tuple, List
 
 import functools
 import numpy as np
 import torch
 
-from nnunetv2.configuration import ANISO_THRESHOLD
 
 
 def _best_device() -> torch.device:
@@ -240,7 +213,8 @@ def _separate_z_seg(t: torch.Tensor, new_shape, axis: int, order: int, order_z: 
     label values; else per-label indicator, painted where ``round(v) > 0.5`` i.e. ``v > 0.5``)."""
     assert t.shape[0] == 1, "seg resampling expects a single channel"
     inplane = [sp for sp in range(3) if sp != axis]
-    mid_shape = list(new_shape); mid_shape[axis] = t.shape[axis + 1]
+    mid_shape = list(new_shape)
+    mid_shape[axis] = t.shape[axis + 1]
     unique = torch.unique(t)
     result_dtype = torch.int16 if int(unique.max()) > 127 else torch.int8
     if order == 0:
@@ -423,20 +397,6 @@ def resample_data_or_seg_to_shape_gpu(
             if (not is_seg) and data.dtype.is_floating_point and result.dtype != data.dtype:
                 result = result.to(data.dtype)
     return result
-
-
-def skimage_resize_torch(data, new_shape, order: int = 3, device=None, is_seg: bool = False):
-    """skimage ``resize(order, mode="edge", anti_aliasing=False)`` / nnU-Net
-    ``resample_data_or_seg_to_shape`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``."""
-    return resample_data_or_seg_to_shape_gpu(data, new_shape, is_seg=is_seg, device=device,
-                             convention="center", order=order, mode="nearest", anti_alias=False)
-
-
-def scipy_zoom_torch(data, new_shape, order: int = 3, mode: str = "nearest", device=None, is_seg: bool = False):
-    """``scipy.ndimage.zoom`` semantics on MPS / CUDA / CPU; ``data`` is ``(c, x, y, z)``.
-    Convenience wrapper for ``resample_data_or_seg_to_shape_gpu(..., convention="corner")``."""
-    return resample_data_or_seg_to_shape_gpu(data, new_shape, is_seg=is_seg, device=device,
-                             convention="corner", order=order, mode=mode)
 
 
 def _resample_seg(
