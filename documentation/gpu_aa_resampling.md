@@ -107,8 +107,8 @@ output samples sit. `resample_aa_torch` exposes both conventions in use in the e
 
 | `convention` | output sample `j` maps to input coordinate | anti-aliasing | matches |
 |---|---|---|---|
-| `"grid"` (default) | `(j + 0.5) * n_in/n_out - 0.5` - half-pixel / cell-centred (`align_corners=False`) | Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, nnU-Net's own `resample_data_or_seg_to_shape` |
-| `"scipy"` | `j * (n_in - 1) / (n_out - 1)` - corner-aligned (`grid_mode=False`) | none; `order` / `mode` honoured | `scipy.ndimage.zoom`, i.e. TotalSegmentator's `change_spacing` |
+| `"grid"` (default) | `(j + 0.5) * n_in/n_out - 0.5` - half-pixel / cell-centered (`align_corners=False`) | Catmull-Rom scaled by the factor when downsampling by > `aa_threshold` | skimage `resize`, `F.interpolate`, nnU-Net's own `resample_data_or_seg_to_shape` |
+| `"scipy"` | `j * (n_in - 1) / (n_out - 1)` - corner-aligned (`grid_mode=False`) | none; `order` / `mode` honored | `scipy.ndimage.zoom`, i.e. TotalSegmentator's `change_spacing` |
 
 `"scipy"` is implemented by **probing `ndimage.zoom` itself**: the resampler is linear and
 separable, so zooming an identity matrix along one axis yields that axis's exact
@@ -116,13 +116,13 @@ separable, so zooming an identity matrix along one axis yields that axis's exact
 which is then applied with the same per-axis matmul as the anti-aliased path. CPU float64
 results equal scipy's to float precision; MPS/CUDA (float32) to ~1e-4 relative. Integer
 inputs are rounded half-away-from-zero on output, as scipy does. `is_seg=True, order=0` is
-the exact nearest-neighbour gather of `zoom(order=0)`.
+the exact nearest-neighbor gather of `zoom(order=0)`.
 
 Why this matters (measured on a chest CT with the TotalSegmentator 3 mm model,
 2026-08-22): the two conventions place the 3 mm grid ~0.4 voxel apart, and because the
 label upsample snaps every boundary to that grid, the convention alone moved mean Dice
 against TS stock from 0.995 to 0.888 (46/110 labels below 0.9). Anti-aliasing on top of it
-changed the mean only to 0.875 - but erased two sub-centimetre structures entirely
+changed the mean only to 0.875 - but erased two sub-centimeter structures entirely
 (gallbladder, adrenal), because the model was trained on scipy's aliased-but-sharp inputs.
 Hence: **match the host pipeline's convention exactly, and treat anti-aliasing as opt-in
 for models trained with it.** `convention="scipy", order=3, mode="nearest"` reproduces

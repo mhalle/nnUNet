@@ -135,7 +135,7 @@ def _scipy_nn_index(n_in: int, n_out: int, mode: str) -> np.ndarray:
 def _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, dtype):
     """``(w, cubic)`` for one axis, or ``None`` for identity. ``convention="grid"`` is the
     half-pixel / anti-aliased policy of :func:`_axis_weights`; ``"scipy"`` is the exact
-    ``ndimage.zoom`` operator (corner-aligned, no anti-aliasing, honours ``order``/``mode``)."""
+    ``ndimage.zoom`` operator (corner-aligned, no anti-aliasing, honors ``order``/``mode``)."""
     if n_in == n_out:
         return None
     if convention == "scipy":
@@ -206,7 +206,7 @@ def resample_aa_torch(
 
     Two sampling conventions, selected with ``convention``:
 
-    * ``"grid"`` (default) - half-pixel centres (``align_corners=False``, the
+    * ``"grid"`` (default) - half-pixel centers (``align_corners=False``, the
       skimage / ``F.interpolate`` / nnU-Net-native convention), anti-aliased
       Catmull-Rom when downsampling by more than ``aa_threshold``, linear otherwise.
       ``order`` / ``mode`` are ignored.
@@ -215,11 +215,11 @@ def resample_aa_torch(
       convention TotalSegmentator's ``change_spacing`` uses. Results match scipy to float
       precision on CPU (float64 in -> float64 math) and to ~1e-4 relative on MPS/CUDA
       (float32). Integer inputs are rounded half-away-from-zero on output, as scipy does.
-      ``is_seg=True`` with ``order=0`` is an exact ``zoom(order=0)`` nearest-neighbour
+      ``is_seg=True`` with ``order=0`` is an exact ``zoom(order=0)`` nearest-neighbor
       label gather; higher orders use one-hot + argmax with the same operator.
 
     Anti-aliasing at inference is a distribution shift for models trained with the
-    scipy/skimage resamplers (it lowers recall on sub-centimetre structures), so use
+    scipy/skimage resamplers (it lowers recall on sub-centimeter structures), so use
     ``"grid"`` with AA only for models trained with it; for existing TotalSegmentator
     models use ``convention="scipy"``.
 
@@ -313,7 +313,7 @@ def _resample_seg(
     """
     assert data.shape[0] == 1, "seg resampling expects a single channel"
     if convention == "scipy" and order == 0:
-        # exact nearest-neighbour gather of scipy.ndimage.zoom(order=0)
+        # exact nearest-neighbor gather of scipy.ndimage.zoom(order=0)
         out = data
         for sp_axis in range(3):
             n_in, n_out = out.shape[sp_axis + 1], int(new_shape[sp_axis])
