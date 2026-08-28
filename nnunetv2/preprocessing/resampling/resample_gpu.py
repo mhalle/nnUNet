@@ -313,6 +313,21 @@ def resample_data_or_seg_to_shape_gpu(
     nnU-Net models use the defaults; for TotalSegmentator's own pre-resampling use
     ``convention="corner"``.
 
+    Cost for ``is_seg=True`` scales as the label count times the output volume: every label
+    is resampled as its own indicator, in groups of ``seg_resample_chunk_labels``. That is
+    the right shape of work at the model grid, where nnU-Net resamples segmentations, and
+    the wrong one for a many-label map at full resolution. Measured on a 112-label whole-body
+    map restored to a 418 M voxel grid: 495 s and 7.8 GB, against 30 s and 2.3 GB for a CPU
+    implementation that crops each label to its own bounding box - anatomy is local, so those
+    boxes sum to roughly one volume however many labels there are. For that direction prefer
+    ``order=0``, or an inverse that decides per output voxel instead of per label.
+
+    ``device`` defaults to the best one available. nnU-Net preprocesses in several worker
+    processes (``-npp``), and each worker that resamples on the GPU holds a context and a
+    working set there, so keep ``-npp`` low when this is the plans' resampler. Note that the
+    reason it defaults high is that resampling is slow on the CPU, which is the thing this
+    changes: a couple of workers is plenty once a resample costs tens of milliseconds.
+
     Signature-compatible with nnU-Net's ``resampling_fn_data`` /
     ``resampling_fn_seg`` / ``resampling_fn_probabilities`` (extra plans kwargs
     such as ``force_separate_z`` / ``order`` are accepted and ignored - the
