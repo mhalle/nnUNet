@@ -78,6 +78,8 @@ nnunetv2.preprocessing.resampling
 resampling function must be callable(data, current_spacing, new_spacing, **kwargs). It must be located in
 nnunetv2.preprocessing.resampling
 - `resampling_fn_seg_kwargs`: kwargs for resampling_fn_seg
+- `logits_to_segmentation_fn`: how predicted logits become a segmentation. Callable(predicted_logits, new_shape, current_spacing, new_spacing, label_manager=, resampling_fn_probabilities=), located in nnunetv2.inference. Optional; defaults to `resample_and_convert`, which resamples the logits and then decides. `fused_resample_and_convert` does both in one pass and never builds the resampled (num_segmentation_heads, *new_shape) volume, see [fused_logit_export.md](fused_logit_export.md)
+- `logits_to_segmentation_fn_kwargs`: kwargs for logits_to_segmentation_fn
 - `network_arch_class_name`: UNet class name, can be used to integrate custom dynamic architectures
 - `UNet_base_num_features`: The number of starting features for the UNet architecture. Default is 32. Default: Features
 are doubled with each downsampling

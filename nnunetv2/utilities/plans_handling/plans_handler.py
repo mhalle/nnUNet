@@ -195,6 +195,28 @@ class ConfigurationManager(object):
         return fn
 
     @property
+    @lru_cache(maxsize=1)
+    def logits_to_segmentation_fn(self) -> Callable:
+        """How predicted logits become a segmentation.
+
+        Called with ``(predicted_logits, new_shape, current_spacing, new_spacing)`` and the
+        keyword arguments ``label_manager`` and ``resampling_fn_probabilities``. Owning both
+        the resampling and the decision lets an implementation fuse them and never build the
+        resampled ``(num_segmentation_heads, *new_shape)`` probability volume.
+
+        Absent from the plans - as it is in every plans file written before this key existed -
+        the default is ``resample_and_convert``, which resamples and then decides exactly as
+        nnU-Net always has.
+        """
+        name = self.configuration.get('logits_to_segmentation_fn', 'resample_and_convert')
+        fn = recursive_find_python_class(join(nnunetv2.__path__[0], "inference"), name,
+                                         'nnunetv2.inference')
+        if fn is None:
+            raise RuntimeError(f"Unable to find logits_to_segmentation function named '{name}'. Please make sure "
+                               f"this fn is located in the nnunetv2.inference module.")
+        return partial(fn, **self.configuration.get('logits_to_segmentation_fn_kwargs', {}))
+
+    @property
     def batch_dice(self) -> bool:
         return self.configuration['batch_dice']
 

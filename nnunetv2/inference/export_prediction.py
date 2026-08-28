@@ -27,16 +27,26 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
         len(configuration_manager.spacing) == \
         len(properties_dict['shape_after_cropping_and_before_resampling']) else \
         [spacing_transposed[0], *configuration_manager.spacing]
-    predicted_logits = configuration_manager.resampling_fn_probabilities(predicted_logits,
-                                            properties_dict['shape_after_cropping_and_before_resampling'],
-                                            current_spacing,
-                                            [properties_dict['spacing'][i] for i in plans_manager.transpose_forward])
-    # return value of resampling_fn_probabilities can be ndarray or Tensor but that does not matter because
-    # apply_inference_nonlin will convert to torch
+    target_spacing = [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]
     if not return_probabilities:
-        # this has a faster computation path because we can skip the softmax in regular (not region based) training
-        segmentation = label_manager.convert_logits_to_segmentation(predicted_logits)
+        # one call owns both the resampling and the decision, so an implementation is free to
+        # fuse them and never build the resampled (num_segmentation_heads, *new_shape) volume
+        segmentation = configuration_manager.logits_to_segmentation_fn(
+            predicted_logits,
+            properties_dict['shape_after_cropping_and_before_resampling'],
+            current_spacing,
+            target_spacing,
+            label_manager=label_manager,
+            resampling_fn_probabilities=configuration_manager.resampling_fn_probabilities)
     else:
+        # exporting probabilities needs the resampled volume itself, so the steps stay apart.
+        # return value of resampling_fn_probabilities can be ndarray or Tensor but that does not
+        # matter because apply_inference_nonlin will convert to torch
+        predicted_logits = configuration_manager.resampling_fn_probabilities(
+            predicted_logits,
+            properties_dict['shape_after_cropping_and_before_resampling'],
+            current_spacing,
+            target_spacing)
         predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
         segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
     del predicted_logits
@@ -130,14 +140,15 @@ def resample_and_save(predicted: Union[torch.Tensor, np.ndarray], target_shape: 
     target_spacing = configuration_manager.spacing if len(configuration_manager.spacing) == \
         len(properties_dict['shape_after_cropping_and_before_resampling']) else \
         [spacing_transposed[0], *configuration_manager.spacing]
-    predicted_array_or_file = configuration_manager.resampling_fn_probabilities(predicted,
-                                                                                target_shape,
-                                                                                current_spacing,
-                                                                                target_spacing)
-
     # create segmentation (argmax, regions, etc)
     label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
-    segmentation = label_manager.convert_logits_to_segmentation(predicted_array_or_file)
+    segmentation = configuration_manager.logits_to_segmentation_fn(
+        predicted,
+        target_shape,
+        current_spacing,
+        target_spacing,
+        label_manager=label_manager,
+        resampling_fn_probabilities=configuration_manager.resampling_fn_probabilities)
     # segmentation may be torch.Tensor but we continue with numpy
     if isinstance(segmentation, torch.Tensor):
         segmentation = segmentation.cpu().numpy()
