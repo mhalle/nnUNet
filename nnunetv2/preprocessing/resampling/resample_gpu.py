@@ -127,7 +127,16 @@ def _axis_operator(n_in, n_out, convention, order, mode, aa_threshold, device, d
 
 
 def _resample_axis(x: torch.Tensor, axis: int, w: torch.Tensor) -> torch.Tensor:
-    """Apply ``(n_out, n_in)`` matrix ``w`` along ``axis`` of ``x`` via matmul."""
+    """Apply ``(n_out, n_in)`` matrix ``w`` along ``axis`` of ``x`` via matmul.
+
+    History worth keeping: an earlier streaming variant of this contracted over a two-column
+    band rather than the whole axis, and on MPS those very small matmuls returned values
+    wrong by ~2 absolute against CPU and einsum. It was worked around with einsum at the
+    time. It does not reproduce on torch 2.13 - matmul there is bit-identical to CPU and to
+    einsum for n_in in {2, 3, 4, 8, 33, 167} - so no workaround is carried here. Noted so
+    that a discrepancy on an older torch is recognizable, and so the workaround is not
+    reintroduced for a defect that is gone.
+    """
     x = x.movedim(axis, -1)                 # (..., n_in)
     shp = x.shape
     x2 = x.reshape(-1, shp[-1])             # (M, n_in)
